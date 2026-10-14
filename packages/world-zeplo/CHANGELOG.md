@@ -1,5 +1,11 @@
 # @open-workflow/world-zeplo
 
+## Unreleased
+
+### Changed
+
+- Moves to `@workflow/world` 5.0.4 alongside `@open-workflow/world-redirect`'s v5 migration (spec version 8). Queued steps are delivered to the flow route.
+
 ## 0.1.0 — 2026-06-02
 
 Initial release.

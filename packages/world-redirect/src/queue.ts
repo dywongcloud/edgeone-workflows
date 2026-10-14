@@ -4,7 +4,6 @@ import {
   MessageId,
   type Queue,
   type QueuePayload,
-  SPEC_VERSION_SUPPORTS_EVENT_SOURCING,
   ValidQueueName,
 } from '@workflow/world';
 import type { RedisClient } from './client/types.js';
@@ -13,6 +12,11 @@ import type { ResolvedRedisWorldConfig } from './config.js';
 import { newMessageId } from './ids.js';
 import type { Keys } from './keys.js';
 
+/**
+ * The HTTP route a job is delivered to. Workflow orchestration and queued
+ * step invocations share the combined flow handler, so every job goes there;
+ * `step` is only read back from job records written by older versions.
+ */
 type Route = 'flow' | 'step';
 
 interface JobRecord {
@@ -43,8 +47,8 @@ const MAX_HOPS = 15;
  */
 const IMMEDIATE_GRACE_MS = 1000;
 
-function routeFor(queueName: string): Route {
-  return queueName.startsWith('__wkf_step_') ? 'step' : 'flow';
+function routeFor(_queueName: string): Route {
+  return 'flow';
 }
 
 function backoffMs(attempt: number, base: number): number {
@@ -70,7 +74,8 @@ export interface RedisQueue extends Queue {
 export function createQueue(
   redis: RedisClient,
   keys: Keys,
-  config: ResolvedRedisWorldConfig
+  config: ResolvedRedisWorldConfig,
+  specVersion: number
 ): RedisQueue {
   const als = new AsyncLocalStorage<HandlerContext>();
   let dispatcherTimer: ReturnType<typeof setTimeout> | null = null;
@@ -97,7 +102,7 @@ export function createQueue(
       body: raw.body ?? '',
       attempt: Number(raw.attempt ?? '1'),
       headers: raw.headers ? decodeBlob<Record<string, string>>(raw.headers) : {},
-      route: (raw.route as Route) ?? routeFor(raw.queueName),
+      route: routeFor(raw.queueName),
     };
   }
 
@@ -203,24 +208,12 @@ export function createQueue(
 
       const message = decodeBlob<QueuePayload>(job.body);
 
-      // Health-check probe: the dashboard fires these against BOTH the
-      // workflow and step queues. In the V2 combined-handler model nothing is
-      // registered for `__wkf_step_*` (steps run inline), so the step probe
-      // would otherwise fall through to a 400. Satisfy the probe directly by
-      // calling the runtime helper, which writes the response stream that
-      // healthCheck() is waiting on. The endpoint is derived from the actual
-      // queue name on the job (not the wrapper's `prefix`), so the same code
-      // path serves both probes.
+      // Health-check probe: satisfy it directly by calling the runtime
+      // helper, which writes the response stream that healthCheck() is
+      // waiting on.
       const hc = (message as any)?.__healthCheck === true ? (message as any) : null;
       if (hc) {
-        const endpoint = job.queueName.startsWith('__wkf_step_')
-          ? 'step'
-          : 'workflow';
-        await handleHealthCheckMessage(
-          hc,
-          endpoint,
-          SPEC_VERSION_SUPPORTS_EVENT_SOURCING
-        );
+        await handleHealthCheckMessage(hc, specVersion);
         if (msgId) await deleteJob(msgId);
         return Response.json({ ok: true });
       }
@@ -233,7 +226,7 @@ export function createQueue(
         (message as any)?.runId ?? (message as any)?.workflowRunId;
 
       const ctx: HandlerContext = { immediate: [] };
-      let result: void | { timeoutSeconds: number };
+      let result: unknown;
       try {
         result = await als.run(ctx, () =>
           handler(message, {
@@ -263,8 +256,12 @@ export function createQueue(
       }
 
       // Re-delivery requested (sleep / wait / long step): durable reschedule.
-      if (result && typeof result.timeoutSeconds === 'number') {
-        const seconds = Math.max(0, result.timeoutSeconds);
+      const timeoutSeconds =
+        typeof result === 'object' && result !== null
+          ? (result as { timeoutSeconds?: unknown }).timeoutSeconds
+          : undefined;
+      if (typeof timeoutSeconds === 'number') {
+        const seconds = Math.max(0, timeoutSeconds);
         if (msgId) await scheduleJob(msgId, Date.now() + seconds * 1000);
         return Response.json({ timeoutSeconds: seconds });
       }

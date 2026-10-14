@@ -12,7 +12,14 @@
  *
  *   {p}/idx-run-status/<status>/<runId>   → presence  (runId sorts by ULID)
  *   {p}/idx-step/<runId>/<stepId>         → presence
- *   {p}/evt/<runId>/<eventId>             → CBOR(event)        (already prefix-listable)
+ *   {p}/evt/<runId>/<eventId>             → CBOR(event)        (eventId = slot, sorts by position)
+ *
+ * Event ids are positions in the run's log (`slotToEventId(1)`, 2, 3, ...).
+ * An append claims the next slot with `put({ifNotExists: true})` and, if the
+ * slot is taken, moves to the next one, so slots stay unique and dense only
+ * when the backend enforces put-if-absent atomically. Where it does not, two
+ * hosts can claim the same slot: run a single dispatcher, as for every other
+ * cross-instance race in this World.
  *   {p}/idx-hook-run/<runId>/<hookId>     → presence
  *
  * Hook token claim:
@@ -28,7 +35,9 @@ import {
   WorkflowRunNotFoundError,
   WorkflowWorldError,
 } from '@workflow/errors';
+import { globalSingleton } from '@workflow/utils';
 import type {
+  CreateEventParams,
   Event,
   EventResult,
   Hook,
@@ -40,8 +49,14 @@ import type {
   WorkflowRunWithoutData,
 } from '@workflow/world';
 import {
-  SPEC_VERSION_SUPPORTS_EVENT_SOURCING,
+  applyAttributeChanges,
+  eventIdToSlot,
+  FIRST_EVENT_SLOT,
+  isChildEntityCreationEvent,
+  SPEC_VERSION_SUPPORTS_SLOT_IDENTITY,
+  slotToEventId,
   stripEventDataRefs,
+  validateAttributeChanges,
   validateUlidTimestamp,
 } from '@workflow/world';
 import {
@@ -49,7 +64,6 @@ import {
   decodeBlob,
   encodeBlob,
   hashToken,
-  newEventId,
   newRunId,
 } from './codec.js';
 import type { Keys } from './keys.js';
@@ -75,6 +89,31 @@ class RunMutex {
     this.inflight.set(runId, task);
     return task;
   }
+}
+
+/** An event as built before it is assigned its slot. */
+type UnslottedEvent = Omit<Event, 'eventId'>;
+
+/**
+ * Highest slot this process has committed per run, keyed by the run's event
+ * prefix. A starting point for the next append, never the authority: the
+ * `ifNotExists` claim decides. Held on globalThis so module copies a bundler
+ * creates share it.
+ */
+const slotHints = globalSingleton('@open-workflow/world-edgeone//kvSlotHints', 1, () => ({
+  byRun: new Map<string, number>(),
+}));
+
+/** The longest run of slots 1, 2, 3, ... at the start of a sorted log. */
+function densePrefix(events: Event[]): Event[] {
+  let n = 0;
+  while (
+    n < events.length &&
+    eventIdToSlot(events[n]!.eventId) === FIRST_EVENT_SLOT + n
+  ) {
+    n++;
+  }
+  return n === events.length ? events : events.slice(0, n);
 }
 
 type StoredRun = WorkflowRun;
@@ -111,7 +150,12 @@ async function putBlob(kv: KV, key: string, value: unknown): Promise<void> {
 }
 
 function stripRunData(run: WorkflowRun): WorkflowRunWithoutData {
-  return { ...run, input: undefined, output: undefined } as WorkflowRunWithoutData;
+  return {
+    ...run,
+    input: undefined,
+    output: undefined,
+    dynamicWorkflowCode: undefined,
+  } as WorkflowRunWithoutData;
 }
 
 function paginateBy<T>(
@@ -149,7 +193,8 @@ export interface KVStorage extends Storage {
 export function createKVStorage(
   kv: KV,
   keys: Keys,
-  owner: { ownerId: string; projectId: string; environment: string }
+  owner: { ownerId: string; projectId: string; environment: string },
+  specVersion: number
 ): KVStorage {
   const mutex = new RunMutex();
 
@@ -175,8 +220,45 @@ export function createKVStorage(
     await kv.put(keys.stepIdx(step.runId, step.stepId), '');
   }
 
-  async function appendEvent(event: Event): Promise<void> {
-    await putBlob(kv, keys.evtBlob(event.runId, event.eventId), event);
+  /** Commits `event` at the run's next free slot and returns it with its id. */
+  async function appendEvent(event: UnslottedEvent): Promise<Event> {
+    const prefix = keys.evtPrefix(event.runId);
+    let slot =
+      (slotHints.byRun.get(prefix) ??
+        (await listAll(kv, prefix)).length) + 1;
+    // Each failed claim proves the slot is taken, so moving up one never
+    // skips a free slot. The bound only stops a broken adapter looping.
+    for (let attempt = 0; attempt < 10_000; attempt++, slot++) {
+      const eventId = slotToEventId(slot);
+      const committed = { ...event, eventId } as Event;
+      const { ok } = await kv.put(
+        keys.evtBlob(event.runId, eventId),
+        encodeBlob(committed),
+        { ifNotExists: true }
+      );
+      if (ok) {
+        slotHints.byRun.set(prefix, slot);
+        return committed;
+      }
+    }
+    throw new WorkflowWorldError(
+      `Could not claim an event slot for run "${event.runId}"`
+    );
+  }
+
+  /** The run's log in slot order, cut at the first slot not yet visible. */
+  async function readLog(runId: string): Promise<Event[]> {
+    const evtKeys = await listAll(kv, keys.evtPrefix(runId));
+    const items: Event[] = [];
+    for (const k of evtKeys) {
+      const e = await getBlob<Event>(kv, k);
+      if (e) items.push(e);
+    }
+    items.sort((a, b) => (a.eventId < b.eventId ? -1 : a.eventId > b.eventId ? 1 : 0));
+    // An eventually consistent list can show slot n+1 before slot n. A reader
+    // must get a prefix of the log, so stop at the first missing slot; the
+    // rest arrives on a later read.
+    return densePrefix(items);
   }
 
   async function readHook(hookId: string): Promise<Hook | null> {
@@ -190,7 +272,7 @@ export function createKVStorage(
   async function createEvent(
     runId: string | null,
     data: any,
-    params?: { resolveData?: 'none' | 'all' }
+    params?: CreateEventParams
   ): Promise<EventResult> {
     if (runId != null && runId !== '') assertSafeEntityId('runId', runId);
     if (typeof data.correlationId === 'string') {
@@ -208,19 +290,46 @@ export function createKVStorage(
       const err = validateUlidTimestamp(effectiveRunId, 'wrun_');
       if (err) throw new WorkflowWorldError(err);
     }
-    return mutex.run(effectiveRunId, () => createImpl(effectiveRunId, data, params));
+    const result = await mutex.run(effectiveRunId, () =>
+      createImpl(effectiveRunId, data, params)
+    );
+    if (params?.eventCount === undefined) return result;
+    return reportSkippedSlots(result, params.eventCount);
+  }
+
+  /**
+   * Bump-and-report: when a write expecting slot `askedFor + 1` landed
+   * higher, return the events in the slots it skipped. No cursor, since the
+   * report is not a page that moves the caller's read position.
+   */
+  async function reportSkippedSlots(
+    result: EventResult,
+    askedFor: number
+  ): Promise<EventResult> {
+    const committed = result.event ? eventIdToSlot(result.event.eventId) : null;
+    if (
+      !result.event ||
+      committed === null ||
+      askedFor < FIRST_EVENT_SLOT ||
+      committed <= askedFor + 1
+    ) {
+      return result;
+    }
+    const span = committed - askedFor - 1;
+    const log = await readLog(result.event.runId);
+    const events = log.slice(askedFor, askedFor + span);
+    return { ...result, events, cursor: null, hasMore: events.length < span };
   }
 
   async function createImpl(
     effectiveRunId: string,
     data: any,
-    params?: { resolveData?: 'none' | 'all' }
+    params?: CreateEventParams
   ): Promise<EventResult> {
-    const eventId = newEventId();
     const now = new Date();
-    const resolveData = params?.resolveData ?? 'all';
-    const effectiveSpecVersion =
-      data.specVersion ?? SPEC_VERSION_SUPPORTS_EVENT_SOURCING;
+    const resolveData =
+      params?.resolveData === 'none' ? 'none' : ('all' as const);
+    const effectiveSpecVersion: number = data.specVersion ?? specVersion;
 
     let currentRun: WorkflowRun | null = null;
     const skipRunRead =
@@ -231,11 +340,22 @@ export function createKVStorage(
     if (data.eventType === 'run_failed' && !currentRun) {
       throw new WorkflowRunNotFoundError(effectiveRunId);
     }
+    // Runs created before slot-numbered event ids hold ULID-numbered logs,
+    // which the runtime cannot replay.
+    if (
+      currentRun &&
+      (currentRun.specVersion ?? 0) < SPEC_VERSION_SUPPORTS_SLOT_IDENTITY
+    ) {
+      throw new WorkflowWorldError(
+        `world-edgeone/kv cannot append to run "${effectiveRunId}": it was created at spec version ${currentRun.specVersion}, before slot-numbered event ids (${SPEC_VERSION_SUPPORTS_SLOT_IDENTITY}), and its log cannot be replayed by this runtime`
+      );
+    }
 
     if (currentRun && isTerminal(currentRun.status)) {
       if (data.eventType === 'run_cancelled' && currentRun.status === 'cancelled') {
-        const event = mkEvent(data, effectiveRunId, eventId, now, effectiveSpecVersion);
-        await appendEvent(event);
+        const event = await appendEvent(
+          mkEvent(data, effectiveRunId, now, effectiveSpecVersion)
+        );
         return { event: stripEventDataRefs(event, resolveData), run: currentRun };
       }
       if (data.eventType === 'run_started') {
@@ -252,14 +372,24 @@ export function createKVStorage(
           `Cannot transition run from terminal state "${currentRun.status}"`
         );
       }
-      if (
-        ['step_created', 'hook_created', 'wait_created'].includes(data.eventType)
-      ) {
+      // A lazy step_started creates its step, so it counts as a creation.
+      if (isChildEntityCreationEvent(data)) {
         throw new EntityConflictError(
           `Cannot create new entities on run in terminal state "${currentRun.status}"`
         );
       }
+      if (data.eventType === 'attr_set') {
+        throw new EntityConflictError(
+          `Cannot set attributes on run in terminal state "${currentRun.status}"`
+        );
+      }
     }
+
+    // Lazy step start: a step_started carrying the step's name and input
+    // creates the step itself. Whoever creates it owns running its body, so
+    // a lazy start for a step that already exists lost that race.
+    const lazyStepStart =
+      data.eventType === 'step_started' && isChildEntityCreationEvent(data);
 
     let validatedStep: Step | null = null;
     if (
@@ -269,13 +399,31 @@ export function createKVStorage(
       data.correlationId
     ) {
       validatedStep = await readStep(effectiveRunId, data.correlationId);
-      if (!validatedStep) {
+      if (lazyStepStart && validatedStep) {
+        throw new EntityConflictError(
+          `Step "${data.correlationId}" already created`
+        );
+      }
+      if (!validatedStep && !lazyStepStart) {
         throw new WorkflowWorldError(`Step "${data.correlationId}" not found`);
       }
-      if (isTerminal(validatedStep.status)) {
+      if (validatedStep && isTerminal(validatedStep.status)) {
         throw new EntityConflictError(
           `Cannot modify step in terminal state "${validatedStep.status}"`
         );
+      }
+      // No work begins on a finished run, even for a step that still reads
+      // `running` (a redelivered start). An in-flight step may still record
+      // its outcome.
+      if (validatedStep && currentRun && isTerminal(currentRun.status)) {
+        if (
+          data.eventType === 'step_started' ||
+          validatedStep.status !== 'running'
+        ) {
+          throw new RunExpiredError(
+            `Cannot ${data.eventType === 'step_started' ? 'start' : 'modify non-running'} step on run in terminal state "${currentRun.status}"`
+          );
+        }
       }
     }
 
@@ -287,7 +435,7 @@ export function createKVStorage(
       if (!h) throw new HookNotFoundError(data.correlationId);
     }
 
-    const event = mkEvent(data, effectiveRunId, eventId, now, effectiveSpecVersion);
+    const event = mkEvent(data, effectiveRunId, now, effectiveSpecVersion);
     if (data.eventType === 'run_started' && 'eventData' in event) {
       delete (event as any).eventData;
     }
@@ -296,6 +444,7 @@ export function createKVStorage(
     let step: Step | undefined;
     let hook: Hook | undefined;
     let wait: Wait | undefined;
+    let stepCreated = false;
 
     switch (data.eventType) {
       case 'run_created': {
@@ -317,7 +466,9 @@ export function createKVStorage(
           error: undefined,
           startedAt: undefined,
           completedAt: undefined,
-          attributes: {},
+          // Carries the reserved lineage attributes ($parentRunId,
+          // $rootRunId) a child run is started with.
+          attributes: rd.attributes ?? {},
           createdAt: now,
           updatedAt: now,
         };
@@ -397,6 +548,40 @@ export function createKVStorage(
         break;
       }
       case 'step_started': {
+        if (lazyStepStart && !validatedStep) {
+          const lazyData = (data as any).eventData as {
+            stepName: string;
+            input: unknown;
+          } & Record<string, unknown>;
+          validatedStep = {
+            runId: effectiveRunId,
+            stepId: data.correlationId,
+            stepName: lazyData.stepName,
+            status: 'pending',
+            input: lazyData.input,
+            output: undefined,
+            error: undefined,
+            attempt: 0,
+            startedAt: undefined,
+            completedAt: undefined,
+            createdAt: now,
+            updatedAt: now,
+            specVersion: effectiveSpecVersion,
+          } as Step;
+          await writeStep(validatedStep);
+          // Replay has to see step_created before step_started.
+          await appendEvent({
+            eventType: 'step_created',
+            runId: effectiveRunId,
+            correlationId: data.correlationId,
+            createdAt: now,
+            specVersion: effectiveSpecVersion,
+            eventData: { stepName: lazyData.stepName, input: lazyData.input },
+          } as UnslottedEvent);
+          stepCreated = true;
+          const { stepName: _n, input: _i, ...rest } = lazyData;
+          (event as any).eventData = rest;
+        }
         if (validatedStep) {
           step = {
             ...validatedStep,
@@ -480,19 +665,17 @@ export function createKVStorage(
             const existing = await readHook(conflictingHookId);
             conflictingRunId = existing?.runId;
           }
-          const conflictEvent: Event = {
+          const conflictEvent = await appendEvent({
             eventType: 'hook_conflict',
             correlationId: data.correlationId,
             runId: effectiveRunId,
-            eventId,
             createdAt: now,
             specVersion: effectiveSpecVersion,
             eventData: {
               token: hd.token,
               ...(conflictingRunId ? { conflictingRunId } : {}),
             },
-          } as Event;
-          await appendEvent(conflictEvent);
+          } as UnslottedEvent);
           return {
             event: stripEventDataRefs(conflictEvent, resolveData),
             hook: undefined,
@@ -562,18 +745,65 @@ export function createKVStorage(
         await putBlob(kv, keys.waitBlob(effectiveRunId, data.correlationId), wait);
         break;
       }
+      case 'attr_set': {
+        if (!currentRun) throw new WorkflowRunNotFoundError(effectiveRunId);
+        validateAttributeChanges(data.eventData.changes, {
+          existingKeys: Object.keys(currentRun.attributes ?? {}),
+          allowReservedAttributes:
+            data.eventData.allowReservedAttributes === true,
+        });
+        // A workflow-body attr_set replays deterministically, so a second
+        // write with its correlationId is a duplicate. Claimed only after
+        // validation, so a rejected write can be retried.
+        if (data.correlationId && data.eventData.writer?.type === 'workflow') {
+          const claim = await kv.put(
+            keys.attrClaim(effectiveRunId, data.correlationId),
+            '',
+            { ifNotExists: true }
+          );
+          if (!claim.ok) {
+            throw new EntityConflictError(
+              `Attribute event "${data.correlationId}" already exists`
+            );
+          }
+        }
+        run = {
+          ...currentRun,
+          attributes: applyAttributeChanges(
+            currentRun.attributes,
+            data.eventData.changes
+          ),
+          updatedAt: now,
+        };
+        await writeRun(run, currentRun.status);
+        break;
+      }
       default:
         break;
     }
 
-    await appendEvent(event);
+    const committed = await appendEvent(event);
+
+    // Preload the log on run_started so the runtime can skip events.list.
+    let preload: { events: Event[]; cursor: string | null; hasMore: boolean } | undefined;
+    if (data.eventType === 'run_started' && run) {
+      const log = await readLog(effectiveRunId);
+      preload = {
+        events: log,
+        cursor:
+          log.length === 0 ? null : Buffer.from(String(log.length)).toString('base64url'),
+        hasMore: false,
+      };
+    }
     return {
-      event: stripEventDataRefs(event, resolveData),
+      event: stripEventDataRefs(committed, resolveData),
       run,
       step,
       hook,
       wait,
-    };
+      ...(stepCreated ? { stepCreated: true as const } : {}),
+      ...(preload ?? {}),
+    } as EventResult;
   }
 
   async function terminalCleanup(runId: string): Promise<void> {
@@ -616,12 +846,20 @@ export function createKVStorage(
         return params?.resolveData === 'none' ? stripRunData(r) : r;
       }) as Storage['runs']['get'],
       list: (async (params?: {
-        status?: WorkflowRun['status'];
+        status?: WorkflowRun['status'] | WorkflowRun['status'][];
         pagination?: PaginationOptions;
         resolveData?: 'none' | 'all';
       }) => {
         let runs: WorkflowRun[];
-        if (params?.status) {
+        if (Array.isArray(params?.status)) {
+          // Any of the listed statuses; an empty array matches nothing, like
+          // SQL `IN ()`.
+          runs = [];
+          for (const s of new Set(params.status)) {
+            runs.push(...(await storage.raw.runsForStatus(s)));
+          }
+          runs.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+        } else if (params?.status) {
           runs = await storage.raw.runsForStatus(params.status);
         } else {
           // Across all statuses — concatenate each status prefix.
@@ -702,13 +940,7 @@ export function createKVStorage(
       },
       async list(params) {
         assertSafeEntityId('runId', params.runId);
-        const evtKeys = await listAll(kv, keys.evtPrefix(params.runId));
-        const items: Event[] = [];
-        for (const k of evtKeys) {
-          const e = await getBlob<Event>(kv, k);
-          if (e) items.push(e);
-        }
-        items.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+        const items = await readLog(params.runId);
         const page = paginateBy(items, params.pagination, 'asc');
         const resolveData = params.resolveData ?? 'all';
         const data =
@@ -726,19 +958,13 @@ export function createKVStorage(
         };
       },
       async listByCorrelationId(params) {
+        assertSafeEntityId('runId', params.runId);
         assertSafeEntityId('correlationId', params.correlationId);
-        // KV has no secondary index; without a runId hint this is a full scan
-        // of the event namespace. Acceptable for now — listByCorrelationId is
-        // used by the dashboard / debug paths, not the hot dispatch path.
-        const allEvtKeys = await listAll(kv, `${keys.root}/evt/`);
-        const items: Event[] = [];
-        for (const k of allEvtKeys) {
-          const e = await getBlob<Event>(kv, k);
-          if (e && (e as any).correlationId === params.correlationId) {
-            items.push(e);
-          }
-        }
-        items.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+        // A correlation id is only unique within its run, so this scans that
+        // run's log rather than the whole event namespace.
+        const items = (await readLog(params.runId)).filter(
+          (e) => (e as any).correlationId === params.correlationId
+        );
         const page = paginateBy(items, params.pagination, 'asc');
         const resolveData = params.resolveData ?? 'all';
         const data =
@@ -797,9 +1023,8 @@ export function createKVStorage(
 function mkEvent(
   data: any,
   runId: string,
-  eventId: string,
   createdAt: Date,
   specVersion: number
-): Event {
-  return { ...data, runId, eventId, createdAt, specVersion } as Event;
+): UnslottedEvent {
+  return { ...data, runId, createdAt, specVersion } as UnslottedEvent;
 }

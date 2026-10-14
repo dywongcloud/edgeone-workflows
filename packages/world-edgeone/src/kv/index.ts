@@ -33,22 +33,20 @@
  *   | hook NX claim   | SETNX                       | put-if-not-exists w/ retry    |
  */
 
-import {
-  SPEC_VERSION_SUPPORTS_EVENT_SOURCING,
-  type World,
-} from '@workflow/world';
+import { globalSingleton } from '@workflow/utils';
+import { mintedSpecVersion, type World } from '@workflow/world';
 import { resolveEdgeOneKV } from './binding.js';
-import { resolveKVConfig, type KVWorldConfig } from './config.js';
-import { keys as makeKeys, type Keys } from './keys.js';
+import { type KVWorldConfig, resolveKVConfig } from './config.js';
+import { type Keys, keys as makeKeys } from './keys.js';
 import { createKVQueue, type KVQueue } from './queue.js';
 import { createKVStorage, type KVStorage } from './storage.js';
 import { createKVStreamer } from './streamer.js';
 import type { KV } from './types.js';
 
+export { adaptNamespace, InMemoryKV } from './adapters.js';
+export { resolveEdgeOneKV } from './binding.js';
 export type { KVWorldConfig } from './config.js';
 export type { KV, KVNamespaceLike } from './types.js';
-export { InMemoryKV, adaptNamespace } from './adapters.js';
-export { resolveEdgeOneKV } from './binding.js';
 
 export interface KVWorld extends World {
   start(): Promise<void>;
@@ -76,7 +74,10 @@ export function createKVWorld(config: KVWorldConfig = {}): KVWorld {
       allowInMemoryFallback: resolved.allowInMemoryFallback,
     });
   const keys = makeKeys(resolved.keyPrefix);
-  const storage = createKVStorage(kv, keys, ownerConfig());
+  // Read per world rather than at module load, so WORKFLOW_SEALED_LOG=0 is
+  // honoured by every world a process creates.
+  const specVersion = mintedSpecVersion();
+  const storage = createKVStorage(kv, keys, ownerConfig(), specVersion);
   const streamer = createKVStreamer(kv, keys, resolved.streamFlushIntervalMs);
   const queue: KVQueue = createKVQueue(kv, keys, {
     baseUrl: resolved.baseUrl,
@@ -89,7 +90,7 @@ export function createKVWorld(config: KVWorldConfig = {}): KVWorld {
   });
 
   const world: KVWorld = {
-    specVersion: SPEC_VERSION_SUPPORTS_EVENT_SOURCING,
+    specVersion,
     queue: queue.queue,
     createQueueHandler: queue.createQueueHandler,
     getDeploymentId: queue.getDeploymentId,
@@ -126,7 +127,12 @@ export function createKVWorld(config: KVWorldConfig = {}): KVWorld {
 
 // ---- singleton entry for WORKFLOW_TARGET_WORLD ----
 
-const cache = new Map<string, KVWorld>();
+// Held on globalThis rather than at module scope: a host that bundles this
+// package into several module graphs would otherwise build one world (and one
+// dispatcher and per-run mutex) per graph.
+const { cache } = globalSingleton('@open-workflow/world-edgeone//kvWorlds', 1, () => ({
+  cache: new Map<string, KVWorld>(),
+}));
 function cacheKey(): string {
   return [
     process.env.WORKFLOW_EDGEONE_KV_BINDING ?? 'EDGEONE_KV',

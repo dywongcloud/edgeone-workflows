@@ -21,7 +21,10 @@
     },
     "./templates/*": "./templates/*"
   },
-  "files": ["dist", "templates"],
+  "files": [
+    "dist",
+    "templates"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
@@ -31,20 +34,23 @@
   },
   "dependencies": {
     "@open-workflow/world-redirect": "workspace:*",
-    "@workflow/errors": "5.0.0-beta.5",
-    "@workflow/world": "5.0.0-beta.5",
+    "@workflow/errors": "5.0.4",
+    "@workflow/utils": "5.0.2",
+    "@workflow/world": "5.0.4",
     "cbor-x": "^1.6.0",
     "ulid": "~3.0.1"
   },
   "peerDependencies": {
     "next": ">=15",
-    "workflow": "5.0.0-beta.8"
+    "workflow": "^5.2.2"
   },
   "devDependencies": {
     "@types/node": "22.19.0",
+    "@workflow/world-testing": "5.0.5",
     "next": "16.2.7",
     "tsx": "4.20.3",
     "typescript": "^5.9.3",
-    "workflow": "5.0.0-beta.8"
+    "vitest": "^4.0.18",
+    "workflow": "5.2.2"
   }
 }

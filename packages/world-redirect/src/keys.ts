@@ -37,9 +37,17 @@ export class Keys {
   eventData(runId: string): string {
     return `${this.p}:eventdata:${runId}`;
   }
-  /** LIST: "runId|eventId" entries sharing a correlationId (o11y index). */
-  corrIndex(correlationId: string): string {
-    return `${this.p}:corr:${correlationId}`;
+  /**
+   * LIST: eventIds within one run sharing a correlationId. A correlation id is
+   * only unique within its run, so the index is scoped to the run.
+   */
+  corrIndex(runId: string, correlationId: string): string {
+    return `${this.p}:corr:${runId}:${correlationId}`;
+  }
+
+  /** STRING (SET NX): dedup claim for a workflow-body attr_set. */
+  attrClaim(runId: string, correlationId: string): string {
+    return `${this.p}:attrclaim:${runId}:${correlationId}`;
   }
 
   // --- hooks ---

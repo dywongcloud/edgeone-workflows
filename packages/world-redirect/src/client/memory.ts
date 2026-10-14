@@ -25,8 +25,8 @@ function normalizeRange(
 /**
  * In-memory implementation of {@link RedisClient}. Faithful to the Redis
  * semantics world-redirect relies on (string values, NX/PX, sorted sets ordered
- * by score then member, list ranges, hashes, pub/sub, and the compare-and-del
- * unlock script).
+ * by score then member, list ranges, hashes, pub/sub, and the two Lua scripts world-redirect
+ * runs: compare-and-del unlock and append-event).
  *
  * NOT durable — state lives in the process. Intended for tests and zero-setup
  * local development. Use a real Redis (node-redis / Upstash) in production.
@@ -228,7 +228,31 @@ export class MemoryRedisClient implements RedisClient {
   }
 
   async eval(script: string, keys: string[], args: string[]): Promise<unknown> {
-    // Emulate the only script world-redirect uses: compare-and-delete unlock.
+    // Emulate the scripts world-redirect runs. Each runs synchronously
+    // between awaits, which gives it the same atomicity Redis gives a script.
+    if (script.startsWith('-- world-redirect:append-event')) {
+      const [listKey, hashKey, corrKey] = keys as [string, string, string];
+      const [prefix, digits, blob, hasCorrelationId] = args as [
+        string,
+        string,
+        string,
+        string,
+      ];
+      const list = this.lists.get(listKey) ?? [];
+      const slot = String(list.length + 1);
+      const id = prefix + slot.padStart(Number(digits), '0');
+      const hash = this.hashes.get(hashKey) ?? new Map<string, string>();
+      hash.set(id, blob);
+      this.hashes.set(hashKey, hash);
+      list.push(id);
+      this.lists.set(listKey, list);
+      if (hasCorrelationId === '1') {
+        const corr = this.lists.get(corrKey) ?? [];
+        corr.push(id);
+        this.lists.set(corrKey, corr);
+      }
+      return id;
+    }
     if (script.includes("redis.call('del'") && script.includes("redis.call('get'")) {
       const key = keys[0]!;
       if (this.alive(key) && this.strings.get(key)!.value === args[0]) {

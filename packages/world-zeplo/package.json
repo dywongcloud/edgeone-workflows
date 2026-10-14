@@ -1,7 +1,7 @@
 {
   "name": "@open-workflow/world-zeplo",
   "version": "0.1.0",
-  "description": "Workflow World that uses Zeplo (https://zeplo.io) for queue dispatch and Redis (via @open-workflow/world-redirect) for storage. Replaces the 307 trampoline + in-process pump with Zeplo's hosted HTTP queue — ideal for serverless platforms where you can't keep a long-running dispatcher alive.",
+  "description": "Workflow World that uses Zeplo (https://zeplo.io) for queue dispatch and Redis (via @open-workflow/world-redirect) for storage. Replaces the 307 trampoline + in-process pump with Zeplo's hosted HTTP queue \u2014 ideal for serverless platforms where you can't keep a long-running dispatcher alive.",
   "type": "module",
   "license": "Apache-2.0",
   "main": "./dist/index.js",
@@ -12,7 +12,9 @@
       "default": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
@@ -21,8 +23,8 @@
   },
   "dependencies": {
     "@open-workflow/world-redirect": "workspace:*",
-    "@workflow/errors": "5.0.0-beta.5",
-    "@workflow/world": "5.0.0-beta.5",
+    "@workflow/errors": "5.0.4",
+    "@workflow/world": "5.0.4",
     "ulid": "~3.0.1"
   },
   "devDependencies": {

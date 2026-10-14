@@ -7,10 +7,6 @@ export function monotonicUlid(): string {
   return ulid();
 }
 
-export function newEventId(): string {
-  return `evnt_${ulid()}`;
-}
-
 export function newRunId(): string {
   return `wrun_${ulid()}`;
 }
@@ -28,8 +24,9 @@ const SAFE_ID = /^[A-Za-z0-9_-]+$/;
 
 /**
  * Reject identifiers that could break out of the key namespace (':' is the
- * key separator) or inject control characters. runIds / correlationIds /
- * eventIds are ULID-based (`prefix_<Crockford base32>`), so the safe set is
+ * key separator) or inject control characters. runIds and correlationIds
+ * are ULID-based (`prefix_<Crockford base32>`) and eventIds are slot
+ * positions (`evnt_<zero-padded digits>`), so the safe set is
  * alphanumerics plus `_` and `-`.
  */
 export function assertSafeEntityId(name: string, value: string): void {

@@ -9,7 +9,9 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { InMemoryKV, createKVWorld } from '../src/kv/index.js';
+import { EntityConflictError, RunExpiredError } from '@workflow/errors';
+import { eventIdToSlot, FIRST_EVENT_SLOT, slotToEventId } from '@workflow/world';
+import { createKVWorld, InMemoryKV } from '../src/kv/index.js';
 
 function freshWorld() {
   const kv = new InMemoryKV();
@@ -210,4 +212,146 @@ test('streams.write/read polls and surfaces chunks', async () => {
   await world.streams.close('rX', 'log');
   const after = await world.streams.getInfo('rX', 'log');
   assert.equal(after.done, true);
+});
+
+async function startedRun(world: ReturnType<typeof freshWorld>['world']) {
+  const created = await world.events.create(null, {
+    eventType: 'run_created',
+    eventData: { workflowName: 'demo', deploymentId: 'dpl_test', input: [] },
+  } as any);
+  const runId = created.run!.runId;
+  await world.events.create(runId, { eventType: 'run_started' } as any);
+  return runId;
+}
+
+test('events are numbered by dense slot, also under concurrent appends', async () => {
+  const { world } = freshWorld();
+  const runId = await startedRun(world);
+  const width = 20;
+  await Promise.all(
+    Array.from({ length: width }, (_, i) =>
+      world.events.create(
+        runId,
+        {
+          eventType: 'step_created',
+          correlationId: `step_${i}`,
+          eventData: { stepName: 'fan', input: [i] },
+        } as any,
+        { eventCount: 2 }
+      )
+    )
+  );
+  const page = await world.events.list({ runId, pagination: { limit: 1000 } });
+  const slots = page.data.map((e) => eventIdToSlot(e.eventId));
+  assert.deepEqual(
+    slots,
+    Array.from({ length: width + 2 }, (_, i) => FIRST_EVENT_SLOT + i)
+  );
+  assert.deepEqual(
+    page.data.map((e) => e.eventId),
+    slots.map((n) => slotToEventId(n!))
+  );
+});
+
+test('a stale write is bumped and reports the slots it skipped', async () => {
+  const { world } = freshWorld();
+  const runId = await startedRun(world);
+  const step = (n: number) =>
+    ({
+      eventType: 'step_created',
+      correlationId: `step_${n}`,
+      eventData: { stepName: 's', input: [n] },
+    }) as any;
+  const first = await world.events.create(runId, step(1), { eventCount: 2 });
+  assert.equal(first.events, undefined);
+  const stale = await world.events.create(runId, step(2), { eventCount: 2 });
+  assert.equal(eventIdToSlot(stale.event!.eventId), 4);
+  assert.deepEqual(
+    stale.events?.map((e) => e.eventId),
+    [first.event!.eventId]
+  );
+  assert.equal(stale.cursor, null);
+  assert.equal(stale.hasMore, false);
+});
+
+test('a slot claimed elsewhere is skipped, not overwritten', async () => {
+  const { kv, world } = freshWorld();
+  const runId = await startedRun(world);
+  // Another host claimed slot 3 behind this process's back.
+  await kv.put(world.keys.evtBlob(runId, slotToEventId(3)), 'taken', {
+    ifNotExists: true,
+  });
+  const res = await world.events.create(runId, {
+    eventType: 'step_created',
+    correlationId: 'step_x',
+    eventData: { stepName: 's', input: [] },
+  } as any);
+  assert.equal(eventIdToSlot(res.event!.eventId), 4);
+  assert.equal(
+    await kv.get(world.keys.evtBlob(runId, slotToEventId(3))),
+    'taken'
+  );
+});
+
+test('events.list returns only the dense prefix of the log', async () => {
+  const { kv, world } = freshWorld();
+  const runId = await startedRun(world);
+  // Slot 4 is visible before slot 3, as an eventually consistent list can show.
+  const third = await world.events.create(runId, {
+    eventType: 'step_created',
+    correlationId: 'step_3',
+    eventData: { stepName: 's', input: [] },
+  } as any);
+  await world.events.create(runId, {
+    eventType: 'step_created',
+    correlationId: 'step_4',
+    eventData: { stepName: 's', input: [] },
+  } as any);
+  await kv.delete(world.keys.evtBlob(runId, third.event!.eventId));
+  const page = await world.events.list({ runId });
+  assert.deepEqual(
+    page.data.map((e) => eventIdToSlot(e.eventId)),
+    [1, 2]
+  );
+});
+
+test('a lazy step_started creates its step exactly once', async () => {
+  const { world } = freshWorld();
+  const runId = await startedRun(world);
+  const lazy = {
+    eventType: 'step_started',
+    correlationId: 'step_lazy',
+    eventData: { stepName: 'lazy', input: [1] },
+  } as any;
+  const first = await world.events.create(runId, lazy);
+  assert.equal(first.stepCreated, true);
+  assert.equal(first.step?.status, 'running');
+  await assert.rejects(world.events.create(runId, lazy), EntityConflictError);
+  const page = await world.events.list({ runId });
+  assert.deepEqual(
+    page.data.map((e) => e.eventType),
+    ['run_created', 'run_started', 'step_created', 'step_started']
+  );
+});
+
+test('step_started is refused on a terminal run', async () => {
+  const { world } = freshWorld();
+  const runId = await startedRun(world);
+  await world.events.create(runId, {
+    eventType: 'step_created',
+    correlationId: 'step_t',
+    eventData: { stepName: 's', input: [] },
+  } as any);
+  await world.events.create(runId, {
+    eventType: 'step_started',
+    correlationId: 'step_t',
+  } as any);
+  await world.events.create(runId, { eventType: 'run_cancelled' } as any);
+  await assert.rejects(
+    world.events.create(runId, {
+      eventType: 'step_started',
+      correlationId: 'step_t',
+    } as any),
+    RunExpiredError
+  );
 });

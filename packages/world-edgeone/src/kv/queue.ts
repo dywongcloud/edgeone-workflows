@@ -118,7 +118,9 @@ export function createKVQueue(
 
   const queue: Queue['queue'] = async (queueName, message, opts) => {
     const messageId = newMessageId();
-    const route = queueName.startsWith('__wkf_step_') ? 'step' : 'flow';
+    // Workflow orchestration and queued step invocations share the combined
+    // flow handler.
+    const route = 'flow' as const;
     const runAtMs =
       Date.now() + Math.max(0, (opts?.delaySeconds ?? 0) * 1000);
     const runId = (message as any)?.runId ?? (message as any)?.workflowRunId ?? '';
@@ -155,7 +157,7 @@ export function createKVQueue(
         return Response.json({ error: 'empty body' }, { status: 400 });
       }
 
-      let result: void | { timeoutSeconds: number };
+      let result: unknown;
       try {
         result = await handler(message, {
           attempt: job.attempt,
@@ -181,8 +183,12 @@ export function createKVQueue(
 
       await kv.delete(jobKey);
       await kv.delete(leaseKey(msgId));
-      if (result && typeof result.timeoutSeconds === 'number') {
-        const sec = Math.max(0, result.timeoutSeconds);
+      const timeoutSeconds =
+        typeof result === 'object' && result !== null
+          ? (result as { timeoutSeconds?: unknown }).timeoutSeconds
+          : undefined;
+      if (typeof timeoutSeconds === 'number') {
+        const sec = Math.max(0, timeoutSeconds);
         await storeJob({
           ...job,
           runAtMs: Date.now() + sec * 1000,

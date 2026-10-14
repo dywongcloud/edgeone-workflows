@@ -10,8 +10,10 @@ import type { ResolvedZeploConfig } from './config.js';
 const ulid = monotonicFactory();
 const newMessageId = () => `msg_${ulid()}`;
 
-function routeFor(queueName: string): 'flow' | 'step' {
-  return queueName.startsWith('__wkf_step_') ? 'step' : 'flow';
+// Workflow orchestration and queued step invocations share the combined flow
+// handler.
+function routeFor(_queueName: string): 'flow' | 'step' {
+  return 'flow';
 }
 
 /**
@@ -123,7 +125,7 @@ export function createZeploQueue(config: ResolvedZeploConfig): Queue {
         );
       }
 
-      let result: void | { timeoutSeconds: number };
+      let result: unknown;
       try {
         result = await handler(message, {
           attempt,
@@ -136,8 +138,12 @@ export function createZeploQueue(config: ResolvedZeploConfig): Queue {
         return Response.json(String(err), { status: 500 });
       }
 
-      if (result && typeof result.timeoutSeconds === 'number') {
-        const seconds = Math.max(0, result.timeoutSeconds);
+      const timeoutSeconds =
+        typeof result === 'object' && result !== null
+          ? (result as { timeoutSeconds?: unknown }).timeoutSeconds
+          : undefined;
+      if (typeof timeoutSeconds === 'number') {
+        const seconds = Math.max(0, timeoutSeconds);
         if (seconds > 0) {
           // Re-enqueue with the requested delay. Zeplo doesn't have a native
           // "delay this retry" header, so we just push a fresh message.

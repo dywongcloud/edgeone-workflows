@@ -4,7 +4,6 @@ import { monotonicFactory } from 'ulid';
 
 const ulid = monotonicFactory();
 
-export const newEventId = () => `evnt_${ulid()}`;
 export const newRunId = () => `wrun_${ulid()}`;
 export const newMessageId = () => `msg_${ulid()}`;
 export const newChunkSeq = () => ulid();

@@ -1,5 +1,24 @@
 # @open-workflow/world-redirect
 
+## Unreleased
+
+### Changed
+
+- **Workflow SDK v5 (spec version 8).** Targets `workflow` 5.2.2 / `@workflow/world` 5.0.4 and declares `specVersion` via `mintedSpecVersion()` (8, or 6 with `WORKFLOW_SEALED_LOG=0`). `workflow` 5.2.x refuses a World below spec version 6 at startup, which this package was (it declared 2).
+- **Event ids are slot positions.** `evnt_` plus the run-log position (`slotToEventId()`), allocated by one Lua script that reads the log length, stores the event and appends it atomically. A write whose `eventCount` was stale lands on the next free slot and returns the events it skipped (`events` / `hasMore`, no cursor).
+- Lazy `step_started` (carrying `stepName` + `input`) creates the step and its `step_created` event; a second lazy start for the same step is an `EntityConflictError`.
+- `step_started` is refused with `RunExpiredError` on a terminal run, even when the step still reads `running`.
+- `runs.list({ status: [...] })` matches any listed status (`[]` matches nothing). Startup recovery relies on this.
+- `events.listByCorrelationId` is scoped to `runId`; the correlation index key now includes the run.
+- `run_created` keeps `eventData.attributes` (child-run lineage), and `attr_set` updates run attributes.
+- Queued steps are delivered to the flow route; the `__wkf_step_*` / `step` route is gone.
+- The `createWorld()` cache lives on `globalThis`, so bundled copies of the package share one world.
+- Adds `@workflow/world-testing` conformance (`src/conformance.test.ts`, runs with `TEST_REDIS_URL`).
+
+### Upgrading
+
+Runs created by 0.2.x hold ULID-numbered event logs that the v5 runtime cannot replay. Drain in-flight runs on the old version before deploying this one: a pre-slot run gets a `WorkflowWorldError` on its next write.
+
 ## 0.2.0 — 2026-06-02
 
 ### Changed

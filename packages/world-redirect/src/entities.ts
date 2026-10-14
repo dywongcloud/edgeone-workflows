@@ -8,8 +8,10 @@ import type {
 } from '@workflow/world';
 import {
   EventSchema,
+  eventIdToSlot,
   HookSchema,
   StepSchema,
+  slotToEventId,
   WaitSchema,
   WorkflowRunSchema,
 } from '@workflow/world';
@@ -36,6 +38,38 @@ function decodeCursor(cursor: string | undefined): number {
     return 0;
   }
 }
+
+/**
+ * Appends one event to a run's log and returns the id it landed on. Event ids
+ * are positions in the run's log (slot 1, 2, 3, ...), so the slot is chosen by
+ * the same atomic script that commits the event: Redis runs a script without
+ * interleaving any other command, which makes the slot unique (no two appends
+ * read the same length), dense (each append takes the next index) and
+ * allocated at the commit (nothing can land behind a slot a reader has
+ * passed). The event blob is stored without its id, which is the hash field
+ * it is stored under.
+ *
+ * KEYS: [eventList, eventData, corrIndex]
+ * ARGV: [idPrefix, idDigits, blob, hasCorrelationId]
+ */
+const APPEND_EVENT_SCRIPT = `-- world-redirect:append-event
+local slot = redis.call('LLEN', KEYS[1]) + 1
+local digits = tostring(slot)
+local id = ARGV[1] .. string.rep('0', tonumber(ARGV[2]) - #digits) .. digits
+redis.call('HSET', KEYS[2], id, ARGV[3])
+redis.call('RPUSH', KEYS[1], id)
+if ARGV[4] == '1' then
+  redis.call('RPUSH', KEYS[3], id)
+end
+return id`;
+
+// Derived from the SDK's own formatter so the script pads exactly as
+// `slotToEventId()` does; `appendEvent` re-checks every id it gets back.
+const EVENT_ID_PREFIX = slotToEventId(1).replace(/0*1$/, '');
+const EVENT_ID_DIGITS = slotToEventId(1).length - EVENT_ID_PREFIX.length;
+
+/** An event as built before the store assigns its slot. */
+export type UnslottedEvent = Omit<Event, 'eventId'>;
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
@@ -89,6 +123,44 @@ export class EntityStore {
     const ids = await this.pageIds(key, params.pagination, 'desc');
     const runs = await Promise.all(ids.data.map((id) => this.getRun(id)));
     return { ...ids, data: runs.filter((r): r is WorkflowRun => r !== null) };
+  }
+
+  /**
+   * Runs whose status is any of `statuses`, newest first. Merges the
+   * per-status indexes into one sorted page; the cursor is the offset into
+   * that merged order, like every other listing here.
+   */
+  async listRunsByStatuses(params: {
+    statuses: string[];
+    pagination?: PaginationOptions;
+  }): Promise<Page<WorkflowRun>> {
+    const statuses = [...new Set(params.statuses)];
+    if (statuses.length === 0) return { data: [], cursor: null, hasMore: false };
+    if (statuses.length === 1) {
+      return this.listRuns({ status: statuses[0], pagination: params.pagination });
+    }
+    const limit = clampLimit(params.pagination?.limit);
+    const offset = decodeCursor(params.pagination?.cursor);
+    const asc = params.pagination?.sortOrder === 'asc';
+    const ids = (
+      await Promise.all(
+        statuses.map((s) =>
+          this.redis.zrangeByRank(this.keys.runsByStatus(s), 0, -1)
+        )
+      )
+    ).flat();
+    const runs = (await Promise.all(ids.map((id) => this.getRun(id)))).filter(
+      (r): r is WorkflowRun => r !== null && statuses.includes(r.status)
+    );
+    runs.sort((a, b) => {
+      const d = a.createdAt.getTime() - b.createdAt.getTime() ||
+        a.runId.localeCompare(b.runId);
+      return asc ? d : -d;
+    });
+    const data = runs.slice(offset, offset + limit);
+    const consumed = offset + data.length;
+    const hasMore = consumed < runs.length;
+    return { data, cursor: hasMore ? encodeCursor(consumed) : null, hasMore };
   }
 
   // ---------------- steps ----------------
@@ -210,25 +282,40 @@ export class EntityStore {
 
   // ---------------- events ----------------
 
-  async appendEvent(event: Event): Promise<void> {
-    await this.redis.hset(
-      this.keys.eventData(event.runId),
-      event.eventId,
-      encodeBlob(event)
+  /** Commits `event` at the run's next free slot and returns it with its id. */
+  async appendEvent(event: UnslottedEvent): Promise<Event> {
+    const { eventId: _ignored, ...blob } = event as Event;
+    const correlationId = event.correlationId ?? '';
+    const id = await this.redis.eval(
+      APPEND_EVENT_SCRIPT,
+      [
+        this.keys.eventList(event.runId),
+        this.keys.eventData(event.runId),
+        this.keys.corrIndex(event.runId, correlationId || '_'),
+      ],
+      [
+        EVENT_ID_PREFIX,
+        String(EVENT_ID_DIGITS),
+        encodeBlob(blob),
+        correlationId ? '1' : '0',
+      ]
     );
-    await this.redis.rpush(this.keys.eventList(event.runId), event.eventId);
-    if (event.correlationId) {
-      await this.redis.rpush(
-        this.keys.corrIndex(event.correlationId),
-        `${event.runId}|${event.eventId}`
+    const slot = typeof id === 'string' ? eventIdToSlot(id) : null;
+    if (slot === null || slotToEventId(slot) !== id) {
+      throw new Error(
+        `[world-redirect] append-event script returned ${String(id)}, which is not a canonical event id`
       );
     }
+    return { ...event, eventId: id } as Event;
   }
 
   async getEvent(runId: string, eventId: string): Promise<Event | null> {
     const raw = await this.redis.hget(this.keys.eventData(runId), eventId);
     if (!raw) return null;
-    return EventSchema.parse(decodeBlob(raw));
+    return EventSchema.parse({
+      ...decodeBlob<Record<string, unknown>>(raw),
+      eventId,
+    });
   }
 
   async listEvents(params: {
@@ -270,10 +357,11 @@ export class EntityStore {
   }
 
   async listEventsByCorrelationId(params: {
+    runId: string;
     correlationId: string;
     pagination?: PaginationOptions;
   }): Promise<Page<Event>> {
-    const listKey = this.keys.corrIndex(params.correlationId);
+    const listKey = this.keys.corrIndex(params.runId, params.correlationId);
     const refs = await this.redis.lrange(listKey, 0, -1);
     const limit = clampLimit(params.pagination?.limit, MAX_LIMIT);
     const offset = decodeCursor(params.pagination?.cursor);
@@ -283,10 +371,7 @@ export class EntityStore {
         : [...refs].reverse();
     const slice = ordered.slice(offset, offset + limit);
     const events = await Promise.all(
-      slice.map(async (ref) => {
-        const [runId, eventId] = ref.split('|');
-        return runId && eventId ? this.getEvent(runId, eventId) : null;
-      })
+      slice.map((eventId) => this.getEvent(params.runId, eventId))
     );
     const data = events.filter((e): e is Event => e !== null);
     const consumed = offset + slice.length;

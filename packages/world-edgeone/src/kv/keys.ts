@@ -49,6 +49,9 @@ export function keys(p: string) {
     evtBlob: (runId: string, eventId: string) =>
       `${root}/evt/${runId}/${eventId}`,
     evtPrefix: (runId: string) => `${root}/evt/${runId}/`,
+    /** Dedup claim for a workflow-body attr_set (put-if-absent). */
+    attrClaim: (runId: string, correlationId: string) =>
+      `${root}/attr-claim/${runId}/${correlationId}`,
     hookBlob: (hookId: string) => `${root}/hook/${hookId}`,
     hookRunIdx: (runId: string, hookId: string) =>
       `${root}/idx-hook-run/${runId}/${hookId}`,

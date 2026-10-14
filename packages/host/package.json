@@ -15,7 +15,9 @@
       "default": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
@@ -25,8 +27,8 @@
   },
   "dependencies": {
     "@open-workflow/world-redirect": "workspace:*",
-    "@workflow/core": "5.0.0-beta.8",
-    "@workflow/world": "5.0.0-beta.5"
+    "@workflow/core": "5.2.2",
+    "@workflow/world": "5.0.4"
   },
   "devDependencies": {
     "@types/node": "22.19.0",

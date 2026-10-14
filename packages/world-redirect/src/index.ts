@@ -1,8 +1,6 @@
+import { globalSingleton } from '@workflow/utils';
 import type { World } from '@workflow/world';
-import {
-  reenqueueActiveRuns,
-  SPEC_VERSION_SUPPORTS_EVENT_SOURCING,
-} from '@workflow/world';
+import { mintedSpecVersion, reenqueueActiveRuns } from '@workflow/world';
 import { createRedisClient } from './client/index.js';
 import type { RedisClient } from './client/types.js';
 import {
@@ -16,9 +14,9 @@ import { createQueue, type RedisQueue } from './queue.js';
 import { createStorage, type HookOwnerConfig } from './storage.js';
 import { createStreamer } from './streamer.js';
 
-export type { RedisWorldConfig } from './config.js';
-export type { RedisClient } from './client/types.js';
 export { NodeRedisClient, UpstashRedisClient } from './client/index.js';
+export type { RedisClient } from './client/types.js';
+export type { RedisWorldConfig } from './config.js';
 
 /**
  * A World instance with the in-process 307 dispatcher controls surfaced for
@@ -53,16 +51,26 @@ function ownerConfig(): HookOwnerConfig {
  */
 export function createRedisWorld(config: RedisWorldConfig = {}): RedisWorld {
   const resolved = resolveConfig(config);
+  // Read per world rather than at module load, so WORKFLOW_SEALED_LOG=0 is
+  // honoured by every world a process creates.
+  const specVersion = mintedSpecVersion();
   const redis = createRedisClient(resolved);
   const keys = new Keys(resolved.keyPrefix);
   const store = new EntityStore(redis, keys);
   const locks = new RunLocks(redis, keys);
-  const queue: RedisQueue = createQueue(redis, keys, resolved);
-  const storage = createStorage(redis, keys, store, locks, ownerConfig());
+  const queue: RedisQueue = createQueue(redis, keys, resolved, specVersion);
+  const storage = createStorage(
+    redis,
+    keys,
+    store,
+    locks,
+    ownerConfig(),
+    specVersion
+  );
   const streamer = createStreamer(redis, keys, resolved.streamFlushIntervalMs);
 
   const world: RedisWorld = {
-    specVersion: SPEC_VERSION_SUPPORTS_EVENT_SOURCING,
+    specVersion,
     // queue
     queue: queue.queue,
     createQueueHandler: queue.createQueueHandler,
@@ -95,7 +103,12 @@ export function createRedisWorld(config: RedisWorldConfig = {}): RedisWorld {
 
 // ---- singleton for the WORKFLOW_TARGET_WORLD loader ----
 
-const cache = new Map<string, RedisWorld>();
+// Held on globalThis rather than at module scope: a host that bundles this
+// package into several module graphs (Next.js does) would otherwise build one
+// world, Redis connection and dispatcher per graph.
+const { cache } = globalSingleton('@open-workflow/world-redirect//worlds', 1, () => ({
+  cache: new Map<string, RedisWorld>(),
+}));
 
 function cacheKey(): string {
   const r = resolveConfig();

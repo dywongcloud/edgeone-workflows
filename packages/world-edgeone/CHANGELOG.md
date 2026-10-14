@@ -1,5 +1,18 @@
 # @open-workflow/world-edgeone
 
+## Unreleased
+
+### Changed
+
+- **Workflow SDK v5 (spec version 8).** Requires `workflow` ^5.2.2; the default export picks up `@open-workflow/world-redirect`'s v5 migration.
+- `/kv` World: declares `mintedSpecVersion()`, numbers events by slot (`slotToEventId()`), claiming each slot with `put({ ifNotExists: true })` and moving up on a taken slot. `events.list` returns only the dense prefix of the log, so an eventually consistent listing never hands the runtime a log with a hole. Bump-and-report, lazy `step_started`, terminal-run `step_started` refusal, multi-status `runs.list`, run-scoped `listByCorrelationId`, run attributes and `attr_set` are implemented as in world-redirect.
+- Slot uniqueness across hosts depends on the KV backend enforcing `ifNotExists` atomically. Where it does not, run a single dispatcher (unchanged guidance).
+- Adds an opt-in conformance run (`WORLD_CONFORMANCE=1`, `src/kv/conformance.test.ts`).
+
+### Upgrading
+
+Runs created before this version hold ULID-numbered event logs that the v5 runtime cannot replay. Drain them before deploying.
+
 ## 0.2.0 — 2026-06-02
 
 Adds an **EdgeOne Pages KV** backend on the `/kv` subpath. The default
